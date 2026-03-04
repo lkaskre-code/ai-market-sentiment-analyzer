@@ -1,0 +1,294 @@
+import os
+import csv
+import time
+import datetime
+import requests
+import tkinter as tk
+from tkinter import messagebox
+from groq import Groq
+from tqdm import tqdm
+from dotenv import load_dotenv
+
+class ToolTip(object):
+    """Creates a tooltip popup when hovering over a widget."""
+    def __init__(self, widget, text='widget info'):
+        self.widget = widget
+        self.text = text
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.close)
+        self.tw = None
+
+    def enter(self, event=None):
+        x, y, cx, cy = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 20
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(self.tw, text=self.text, justify='left',
+                         background='#ffffe0', relief='solid', borderwidth=1,
+                         font=("Arial", "9", "normal"), padx=5, pady=2)
+        label.pack(ipadx=1)
+
+    def close(self, event=None):
+        if self.tw:
+            self.tw.destroy()
+
+def create_input_row(root, label_text, tooltip_text, default_val, is_password=False):
+    """Helper function to create a labeled input with a tooltip."""
+    frame = tk.Frame(root)
+    frame.pack(pady=(10, 2))
+    
+    lbl = tk.Label(frame, text=label_text, font=("Arial", 10, "bold"))
+    lbl.pack(side="left")
+    
+    help_lbl = tk.Label(frame, text=" [?]", font=("Arial", 10, "bold"), fg="blue", cursor="question_arrow")
+    help_lbl.pack(side="left")
+    ToolTip(help_lbl, tooltip_text)
+    
+    entry = tk.Entry(root, width=40, justify="center", show="*" if is_password else "")
+    if default_val:
+        entry.insert(0, default_val)
+    entry.pack()
+    
+    return entry
+
+def get_user_inputs():
+    """Opens a dashboard for entering all analysis parameters."""
+    load_dotenv() 
+    inputs = {}
+    
+    def submit():
+        inputs['query'] = entry_query.get().strip()
+        inputs['amount'] = entry_amount.get().strip()
+        inputs['days'] = entry_days.get().strip()
+        inputs['news_key'] = entry_news_key.get().strip()
+        inputs['groq_key'] = entry_groq_key.get().strip()
+        
+        if not all([inputs['query'], inputs['amount'], inputs['days'], inputs['news_key'], inputs['groq_key']]):
+            messagebox.showwarning("Missing Input", "Please fill out all fields.")
+            return
+            
+        try:
+            inputs['amount'] = int(inputs['amount'])
+            inputs['days'] = int(inputs['days'])
+            
+            # API Limit Protection
+            if inputs['days'] > 30:
+                messagebox.showwarning("API Limit", "The free NewsAPI tier only allows fetching articles from the last 30 days.\nPlease enter a number between 1 and 30.")
+                return
+                
+        except ValueError:
+            messagebox.showwarning("Format Error", "Amount of articles and timeframe (days) must be numbers.")
+            return
+            
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Configuration: AI Market Sentiment")
+    root.geometry("450x450")
+    
+    env_news = os.getenv("NEWS_API_KEY", "")
+    env_groq = os.getenv("GROQ_API_KEY", "")
+    
+    entry_query = create_input_row(
+        root, "Search Query:", "Enter the market or asset you want to analyze.\nExamples: Bitcoin, Gold, Tesla, S&P 500", ""
+    )
+    entry_query.focus()
+    
+    entry_amount = create_input_row(
+        root, "Amount of Articles:", "How many news articles should the AI analyze?\nMore articles take longer but improve accuracy.", "20"
+    )
+    
+    entry_days = create_input_row(
+        root, "Timeframe (last X days):", "Enter how many days back the search should go.\nMAXIMUM: 30 days (Free API limit).", "7"
+    )
+    
+    entry_news_key = create_input_row(
+        root, "NewsAPI Key:", "Your API Key to fetch news.\nGet a free key at: https://newsapi.org", env_news, is_password=True
+    )
+    
+    entry_groq_key = create_input_row(
+        root, "Groq API Key:", "Your API Key for the Llama-3 AI model.\nGet a free key at: https://console.groq.com", env_groq, is_password=True
+    )
+    
+    tk.Button(root, text="Start Analysis", command=submit, font=("Arial", 12, "bold"), bg="#4CAF50", fg="white").pack(pady=25)
+    
+    root.bind('<Return>', lambda event: submit())
+    root.mainloop()
+    
+    return inputs
+
+def fetch_news(inputs):
+    """Fetches articles based on user inputs and calculates the date."""
+    url = "https://newsapi.org/v2/everything"
+    target_date = datetime.date.today() - datetime.timedelta(days=inputs['days'])
+    date_str = target_date.strftime("%Y-%m-%d")
+    
+    params = {
+        "q": inputs['query'],
+        "apiKey": inputs['news_key'],
+        "from": date_str,
+        "pageSize": inputs['amount'],
+        "language": "en",
+        "sortBy": "relevancy"
+    }
+    
+    # Timeout added to prevent network freezes
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status() 
+    return response.json().get("articles", [])
+
+def analyze_sentiment_and_relevance(articles, inputs, client):
+    """Evaluates sentiment and relevance for the weighted average using Llama-3."""
+    scores = []
+    weights = []
+    summaries = []
+    
+    for article in tqdm(articles, desc="AI Analysis in progress", unit=" articles", colour="cyan"):
+        title = article.get("title", "")
+        description = article.get("description", "No description available.")
+        
+        prompt = (
+            f"You are an analytical financial expert. Evaluate this news for the '{inputs['query']}' market.\n"
+            f"Title: {title}\nDescription: {description}\n\n"
+            "Reply EXCLUSIVELY in exactly this format:\n"
+            "Sentiment (1-10) | Relevance (1-10) | Reason (max 5 words)"
+        )
+        
+        while True:
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0
+                )
+                text = response.choices[0].message.content
+                parts = [p.strip() for p in text.split("|")]
+                
+                if len(parts) >= 3:
+                    # Robust parsing: Extracts only digits to prevent crash if AI adds words
+                    score_str = ''.join(filter(str.isdigit, parts[0]))
+                    weight_str = ''.join(filter(str.isdigit, parts[1]))
+                    
+                    if score_str and weight_str:
+                        score = int(score_str)
+                        weight = int(weight_str)
+                        reason = parts[2].strip()
+                        
+                        scores.append(score)
+                        weights.append(weight)
+                        summaries.append(reason)
+                        
+                        # Rate Limit Protection: Wait slightly before next request
+                        time.sleep(1.5)
+                        break
+                    else:
+                        raise ValueError("Parsed parts do not contain valid numbers.")
+                else:
+                    raise ValueError("AI did not follow the 'Value|Value|Text' format.")
+                    
+            except Exception as e:
+                print(f"\n[Warning] AI format error ({e}). Retrying in 3 seconds...")
+                time.sleep(3)
+                
+    return scores, weights, summaries
+
+def calculate_weighted_average(scores, weights):
+    """Calculates the weighted average score."""
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return sum(scores) / len(scores) if scores else 0
+    
+    weighted_sum = sum(s * w for s, w in zip(scores, weights))
+    return weighted_sum / total_weight
+
+def save_to_csv(inputs, average_score, level, summary):
+    """Saves the structured data to a CSV file."""
+    file_name = "Sentiments_report.csv"
+    file_exists = os.path.isfile(file_name)
+    
+    while True:
+        try:
+            # utf-8-sig ensures perfect compatibility with Microsoft Excel
+            with open(file_name, "a", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                if not file_exists:
+                    writer.writerow(["Date", "Market", "Sample Size", "Weighted Score", "Level", "Summary"])
+                writer.writerow([
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
+                    inputs['query'], 
+                    inputs['amount'], 
+                    f"{average_score:.2f}", 
+                    level, 
+                    summary
+                ])
+            break
+        except PermissionError:
+            print("\n[Error] The file is open (e.g., in Excel). Please close it...")
+            time.sleep(10)
+
+def show_result_gui(inputs, average_score, level, color, overall_summary):
+    """Displays the final result in a UI window."""
+    root = tk.Tk()
+    root.title(f"Result: {inputs['query'].upper()}")
+    root.geometry("700x350")
+    
+    tk.Label(root, text=f"Market: {inputs['query'].upper()}", font=("Arial", 16, "bold")).pack(pady=10)
+    
+    text = f"Weighted Sentiment Score: {average_score:.2f} / 10\nLevel: {level.upper()}"
+    tk.Label(root, text=text, font=("Arial", 22, "bold"), fg=color).pack(pady=10)
+    
+    tk.Label(root, text=f"AI Conclusion:\n{overall_summary}", font=("Arial", 14, "italic"), wraplength=600, justify="center").pack(pady=20)
+    
+    tk.Button(root, text="Close", command=root.destroy, font=("Arial", 12)).pack(pady=10)
+    root.mainloop()
+
+def main():
+    """Main execution flow."""
+    inputs = get_user_inputs()
+    
+    if not inputs:
+        print("Program aborted.")
+        return 
+
+    print(f"\n--- Starting data fetching for: {inputs['query'].upper()} ---")
+    client = Groq(api_key=inputs['groq_key'])
+    
+    try:
+        articles = fetch_news(inputs)
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Network or API Error. Details: {e}")
+        return
+        
+    if not articles:
+        print("[ERROR] No current articles found. Try a broader search term or a different timeframe.")
+        return
+
+    print("\n--- Starting AI Classification (Sentiment & Relevance) ---")
+    scores, weights, summaries = analyze_sentiment_and_relevance(articles, inputs, client)
+
+    print("\n--- Generating Market Summary ---")
+    prompt2 = f"Summarize the market sentiment for {inputs['query']} in one professional sentence, based on these analyst notes: {summaries}"
+    antwort2 = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt2}],
+        temperature=0.3
+    )
+    overall_summary = antwort2.choices[0].message.content.strip()
+
+    average = calculate_weighted_average(scores, weights)
+    
+    if average < 4.5:
+        level, color = "bearish (negative)", "red"
+    elif average > 6.5:
+        level, color = "bullish (positive)", "green"
+    else:
+        level, color = "neutral", "blue"
+
+    save_to_csv(inputs, average, level, overall_summary)
+    print(f"\n[SUCCESS] Data saved to 'Sentiments_report.csv'.")
+    show_result_gui(inputs, average, level, color, overall_summary)
+
+if __name__ == "__main__":
+    main()
